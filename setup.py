@@ -15,6 +15,34 @@ def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
+def get_configured_cuda_arch_list():
+    """Return configured CUDA arch list from env, preferring PyTorch's convention."""
+    torch_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    if torch_arch_list:
+        return "TORCH_CUDA_ARCH_LIST", torch_arch_list
+
+    cuda_architectures = os.environ.get("CUDA_ARCHITECTURES")
+    if cuda_architectures:
+        return "CUDA_ARCHITECTURES", cuda_architectures
+
+    return None, None
+
+
+def normalize_cuda_arch(arch):
+    """Convert 7.5 / 75 / 8.6+PTX to nvcc-compatible compute capability tokens."""
+    arch = arch.strip()
+    if not arch:
+        raise ValueError("empty CUDA architecture entry")
+
+    arch, plus_ptx, ptx_suffix = arch.partition("+")
+    normalized = arch.replace(".", "")
+
+    if not normalized.isdigit():
+        raise ValueError(f"invalid CUDA architecture '{arch}'")
+
+    return normalized, bool(plus_ptx and ptx_suffix.upper() == "PTX")
+
+
 def configure_cuda():
     """Configure CUDA/ROCm backend."""
     fallback_archs = [
@@ -33,20 +61,31 @@ def configure_cuda():
     else:
         compiler_args["nvcc"].extend(("--maxrregcount=32", "--use_fast_math"))
 
-        # Check for CUDA_ARCHITECTURES environment variable first
-        cuda_archs_env = os.environ.get('CUDA_ARCHITECTURES')
+        # Respect PyTorch's TORCH_CUDA_ARCH_LIST behavior when provided.
+        cuda_archs_env_name, cuda_archs_env = get_configured_cuda_arch_list()
         arch_configured = False
 
         if cuda_archs_env:
             try:
-                archs = [arch.strip() for arch in cuda_archs_env.split(';')]
-                log(f"Using CUDA architectures from environment: {archs}")
-                for arch in archs:
-                    compiler_args["nvcc"].append(f"-gencode=arch=compute_{arch},code=sm_{arch}")
-                detected_arch = f"env:{','.join(archs)}"
+                archs = [arch.strip() for arch in cuda_archs_env.replace(" ", ";").split(';') if arch.strip()]
+                log(f"Using CUDA architectures from {cuda_archs_env_name}: {archs}")
+                if cuda_archs_env_name == "TORCH_CUDA_ARCH_LIST":
+                    # Let torch.utils.cpp_extension translate the env var exactly like PyTorch/PyTorch3D.
+                    detected_arch = f"{cuda_archs_env_name}:{';'.join(archs)}"
+                else:
+                    for arch in archs:
+                        normalized_arch, include_ptx = normalize_cuda_arch(arch)
+                        compiler_args["nvcc"].append(
+                            f"-gencode=arch=compute_{normalized_arch},code=sm_{normalized_arch}"
+                        )
+                        if include_ptx:
+                            compiler_args["nvcc"].append(
+                                f"-gencode=arch=compute_{normalized_arch},code=compute_{normalized_arch}"
+                            )
+                    detected_arch = f"{cuda_archs_env_name}:{';'.join(archs)}"
                 arch_configured = True
             except Exception as e:
-                log(f"Failed to parse CUDA_ARCHITECTURES environment variable: {e}. Trying device detection.")
+                log(f"Failed to parse {cuda_archs_env_name}: {e}. Trying device detection.")
 
         # Try device detection if environment variable not set or failed
         if not arch_configured:
